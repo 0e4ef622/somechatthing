@@ -1,104 +1,158 @@
-#![feature(try_from)]
+use actix::prelude::*;
+use tokio::net::TcpListener;
+use futures::prelude::*;
 
-use std::convert::TryInto;
+pub mod codec;
 
-use futures::{
-    future::{Either, Loop},
-};
-use actix_service::{NewService, IntoNewService};
-use tokio::{io, net::TcpStream, prelude::*};
+pub mod conn_mgr {
+    use actix::prelude::*;
+    use tokio::net::TcpStream;
 
-fn read_u64(stream: TcpStream) -> impl Future<Item=(TcpStream, u64), Error=io::Error> {
-    tokio::io::read_exact(stream, [0u8; 8])
-        .map(|(stream, buf)| {
-            (stream, u64::from_be_bytes(buf))
-        })
+    #[derive(Default)]
+    pub struct ConnectionsManager {
+        connections: Vec<Addr<crate::client_sess::Session>>,
+    }
+
+    impl Actor for ConnectionsManager {
+        type Context = Context<Self>;
+    }
+
+    impl Supervised for ConnectionsManager {}
+    impl SystemService for ConnectionsManager {}
+
+    pub struct Connect(pub TcpStream);
+
+    impl Message for Connect {
+        type Result = ();
+    }
+
+    impl Handler<Connect> for ConnectionsManager {
+        type Result = ();
+        fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) {
+            let addr = crate::client_sess::Session::new(msg.0).start();
+            self.connections.push(addr);
+        }
+    }
+
+    pub struct Stopped(pub Addr<crate::client_sess::Session>);
+
+    impl Message for Stopped {
+        type Result = ();
+    }
+
+    impl Handler<Stopped> for ConnectionsManager {
+        type Result = ();
+        fn handle(&mut self, msg: Stopped, _ctx: &mut Self::Context) {
+            self.connections.retain(|a| a != &msg.0);
+        }
+    }
 }
 
-fn handle_ping(stream: TcpStream) -> impl Future<Item=TcpStream, Error=io::Error> {
-    read_u64(stream)
-        .and_then(|(stream, id)| {
-            println!("received ping from {}", id);
-            tokio::io::write_all(stream, [1])
-        })
-        .map(|(stream, _)| stream)
-}
+pub mod client_sess {
+    use crate::codec::{ClientMessage, DecodeError, MsgDecoder};
 
-fn handle_message(stream: TcpStream) -> impl Future<Item=TcpStream, Error=io::Error> {
-    tokio::io::read_exact(stream, [0u8; 16])
-        .map(|(stream, buf)| {
-            (stream, u64::from_be_bytes(buf[0..8].try_into().unwrap()), u64::from_be_bytes(buf[8..16].try_into().unwrap()))
-        })
-        .and_then(|(stream, id, len)| {
-            tokio::io::read_exact(stream, vec![0; len as usize])
-                .map(move |(stream, buf)| (stream, id, buf))
-        })
-        .map(|(stream, id, msg)| {
-            print!("{} says \"", id);
-            std::io::stdout().write_all(&msg).unwrap();
-            println!("\"");
-            stream
-        })
-}
+    use actix::prelude::*;
+    use tokio::{
+        prelude::*,
+        codec,
+        io::WriteHalf,
+        net::TcpStream,
+    };
 
-fn handle_broadcast(stream: TcpStream) -> impl Future<Item=TcpStream, Error=io::Error> {
-    tokio::io::read_exact(stream, [0u8; 16])
-        .map(|(stream, buf)| {
-            (stream, u64::from_be_bytes(buf[0..8].try_into().unwrap()), u64::from_be_bytes(buf[8..16].try_into().unwrap()))
-        })
-        .and_then(|(stream, id, len)| {
-            tokio::io::read_exact(stream, vec![0; len as usize])
-                .map(move |(stream, buf)| (stream, id, buf))
-        })
-        .map(|(stream, id, msg)| {
-            print!("{} broadcasts \"", id);
-            std::io::stdout().write_all(&msg).unwrap();
-            println!("\"");
-            stream
-        })
-}
+    pub struct Session {
+        /// Only exists when being constructed, `Actor::started()` will consume this to set up the
+        /// message stream.
+        connection: Option<TcpStream>,
+        /// Only exists after the actor receives a `Ready` message from itself, when the connection
+        /// is split and the read half becomes part of the message stream.
+        write_half: Option<WriteHalf<TcpStream>>,
+        id: u64,
+    }
 
-fn handle_frame(stream: TcpStream) -> impl Future<Item=Loop<(), TcpStream>, Error=io::Error> {
-    io::read_exact(stream, [0u8])
-        .and_then(|(stream, buf)| -> Either<Box<dyn Future<Item=_,Error=_>>, _> {
-            match buf[0] {
-                1 => Either::A(Box::new(handle_ping(stream).map(|stream| Loop::Continue(stream)))),
-                2 => Either::A(Box::new(handle_message(stream).map(|stream| Loop::Continue(stream)))),
-                c => {
-                    eprintln!("Unrecognized code {}, closing connection with {}", c, stream.peer_addr().unwrap());
-                    Either::B(future::ok(Loop::Break(())))
+    impl Session {
+        pub fn new(conn: TcpStream) -> Self {
+            Session {
+                connection: Some(conn),
+                write_half: None,
+                id: 0,
+            }
+        }
+    }
+
+    impl Actor for Session {
+        type Context = Context<Self>;
+        fn started(&mut self, ctx: &mut Self::Context) {
+            eprintln!("Incoming connection from {}", self.connection.as_ref().unwrap().peer_addr().unwrap());
+            let addr = ctx.address();
+            // wait for the client to send it's id
+            let fut = tokio::io::read_exact(self.connection.take().unwrap(), [0; 8])
+                .map_err(|e| println!("{}", e))
+                .and_then(move |(c, id)| {
+                    addr.send(Ready(c, u64::from_be_bytes(id)))
+                        .map_err(|_| ())
+                });
+            actix::spawn(fut);
+        }
+        fn stopped(&mut self, ctx: &mut Self::Context) {
+            System::current()
+                .registry()
+                .get::<crate::conn_mgr::ConnectionsManager>()
+                .do_send(crate::conn_mgr::Stopped(ctx.address()));
+        }
+    }
+    struct Ready(TcpStream, u64);
+    impl Message for Ready {
+        type Result = ();
+    }
+    impl Handler<Ready> for Session {
+        type Result = ();
+        fn handle(&mut self, Ready(conn, id): Ready, ctx: &mut Self::Context) {
+            eprintln!("{} has identified itself as id {}", conn.peer_addr().unwrap(), id);
+            let (read_half, write_half) = conn.split();
+
+            ctx.add_stream(codec::FramedRead::new(read_half, MsgDecoder));
+
+            self.write_half = Some(write_half);
+            self.id = id;
+        }
+    }
+
+    impl StreamHandler<ClientMessage, DecodeError> for Session {
+        fn handle(&mut self, msg: ClientMessage, ctx: &mut Self::Context) {
+            let id = self.id;
+            match msg {
+                ClientMessage::Ping => {
+                    eprintln!("received ping from {}", self.id);
+                    let write_half = self.write_half.take().unwrap();
+                    let fut = tokio::io::write_all(write_half, [1]);
+                    let fut = actix::fut::wrap_future(fut)
+                        .map(|(write_half, _), actor: &mut Session, _ctx| actor.write_half = Some(write_half))
+                        .map_err(move |e, _actor, ctx| {
+                            eprintln!("error sending pong to {}: {}", id, e);
+                            ctx.stop();
+                        });
+                    ctx.wait(fut);
+                }
+                ClientMessage::Send(msg) => {
+                    eprintln!("{} says \"{}\"", self.id, String::from_utf8_lossy(&msg));
                 }
             }
-        })
+        }
+    }
 }
 
 fn main() {
-    let sys = actix_rt::System::new("test");
-
-    actix_server::build()
-        .bind(
-            // configure service pipeline
-            "basic",
-            "0.0.0.0:2000",
-            || {
-                (move |stream: tokio::net::TcpStream| {
-                    let peer_addr = stream.peer_addr().unwrap();
-                    println!("incoming connection from {}", peer_addr);
-                    future::loop_fn(stream, handle_frame)
-                        .map_err(move |e| (e, peer_addr))
-                })
-                .into_new_service()
-                .map_err(|(e, peer_addr)| {
-                    match e.kind() {
-                        io::ErrorKind::UnexpectedEof => println!("connection with {} closed by client", peer_addr),
-                        _ => println!("{}", e),
-                    }
-                })
-                .map(|_| ())
-            },
-        )
-        .unwrap()
-        .start();
-
-    sys.run();
+    System::run(|| {
+        let conn_mgr_addr = conn_mgr::ConnectionsManager::create(|ctx| {
+            ctx.add_message_stream(
+                TcpListener::bind(&"0.0.0.0:2000".parse().unwrap())
+                    .unwrap()
+                    .incoming()
+                    .map(conn_mgr::Connect)
+                    .map_err(|_| ())
+            );
+            conn_mgr::ConnectionsManager::default()
+        });
+        System::current().registry().set(conn_mgr_addr);
+    });
 }

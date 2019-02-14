@@ -6,11 +6,6 @@ edition = "2018"
 
 [dependencies]
 actix = "0.7"
-actix-codec = "0.1"
-actix-connector = "0.1"
-actix-rt = "0.1"
-actix-server = "0.1"
-actix-service = "0.1"
-actix-utils = "0.1"
+bytes = "0.4"
 futures = "0.1"
 tokio = "0.1"
